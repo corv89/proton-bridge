@@ -36,6 +36,7 @@ import (
 	"github.com/ProtonMail/proton-bridge/v3/internal/services/syncservice"
 	"github.com/ProtonMail/proton-bridge/v3/internal/services/userevents"
 	"github.com/ProtonMail/proton-bridge/v3/internal/services/useridentity"
+	"github.com/ProtonMail/proton-bridge/v3/internal/unleash"
 	"github.com/ProtonMail/proton-bridge/v3/internal/usertypes"
 	"github.com/ProtonMail/proton-bridge/v3/pkg/cpc"
 	"github.com/sirupsen/logrus"
@@ -91,7 +92,8 @@ type Service struct {
 	lastHandledEventID string
 	isSyncing          atomic.Bool
 
-	observabilitySender observability.Sender
+	observabilitySender  observability.Sender
+	labelConflictManager *LabelConflictManager
 }
 
 func NewService(
@@ -112,6 +114,7 @@ func NewService(
 	maxSyncMemory uint64,
 	showAllMail bool,
 	observabilitySender observability.Sender,
+	getFeatureFlagValueFn unleash.GetFlagValueFn,
 ) *Service {
 	subscriberName := fmt.Sprintf("imap-%v", identityState.User.ID)
 
@@ -121,7 +124,8 @@ func NewService(
 	})
 	rwIdentity := newRWIdentity(identityState, bridgePassProvider, keyPassProvider)
 
-	syncUpdateApplier := NewSyncUpdateApplier()
+	labelConflictManager := NewLabelConflictManager(serverManager, gluonIDProvider, client, reporter, getFeatureFlagValueFn)
+	syncUpdateApplier := NewSyncUpdateApplier(labelConflictManager)
 	syncMessageBuilder := NewSyncMessageBuilder(rwIdentity)
 	syncReporter := newSyncReporter(identityState.User.ID, eventPublisher, time.Second)
 
@@ -156,7 +160,8 @@ func NewService(
 		syncReporter:       syncReporter,
 		syncConfigPath:     GetSyncConfigPath(syncConfigDir, identityState.User.ID),
 
-		observabilitySender: observabilitySender,
+		observabilitySender:  observabilitySender,
+		labelConflictManager: labelConflictManager,
 	}
 }
 
@@ -355,6 +360,12 @@ func (s *Service) run(ctx context.Context) { //nolint gocyclo
 
 			case *onBadEventReq:
 				s.log.Debug("Bad Event Request")
+				// // Log remote label IDs stored in the local labelMap.
+				s.labels.LogLabels()
+				// Log the remote label IDs store in Gluon.
+				if err := s.logRemoteMailboxIDsFromServer(ctx, s.connectors); err != nil {
+					s.log.Warnf("Could not obtain remote mailbox IDs from server: %v", err)
+				}
 				err := s.removeConnectorsFromServer(ctx, s.connectors, false)
 				req.Reply(ctx, nil, err)
 
@@ -570,6 +581,16 @@ func (s *Service) addConnectorsToServer(ctx context.Context, connectors map[stri
 	}
 
 	return nil
+}
+
+func (s *Service) logRemoteMailboxIDsFromServer(ctx context.Context, connectors map[string]*Connector) error {
+	addrIDs := make([]string, 0, len(connectors))
+
+	for _, c := range connectors {
+		addrIDs = append(addrIDs, c.addrID)
+	}
+
+	return s.serverManager.LogRemoteLabelIDs(ctx, s.gluonIDProvider, addrIDs...)
 }
 
 func (s *Service) removeConnectorsFromServer(ctx context.Context, connectors map[string]*Connector, deleteData bool) error {
